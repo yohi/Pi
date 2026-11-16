@@ -286,11 +286,17 @@ run_action() {
 }
 pause() { printf '\nPress Enter to return to menu...' >&2; read -r _ </dev/tty || true; }
 tui() {
-  need_root
+  local demo_role="${1:-}"
+  if [[ -n "$demo_role" ]]; then
+    [[ "$demo_role" == pi || "$demo_role" == host ]] || fail 'Demo role must be pi or host.'
+  else
+    need_root
+  fi
   command -v fzf >/dev/null || fail 'fzf is not installed.'
   [[ -t 0 && -t 1 ]] || fail 'TUI requires an interactive terminal.'
   local -a menu_options
-  local choice menu_role
+  local choice menu_role selected_role header
+  selected_role="${demo_role:-$(role)}"
   # Follow dotfiles-term's tmux-selector format: a Bash array of bracketed
   # actions, a 40%-height reverse fzf list, a border and an explicit prompt.
   while :; do
@@ -300,7 +306,7 @@ tui() {
       '[PAN Activate]'
     )
     menu_role='Host'
-    if [[ "$(role)" == pi ]]; then
+    if [[ "$selected_role" == pi ]]; then
       menu_role='Pi'
       menu_options+=(
         '[Recovery AP Setup]'
@@ -319,10 +325,30 @@ tui() {
       '[Logs]'
       '[Exit]'
     )
+    if [[ -n "$demo_role" ]]; then
+      header='DEMO ONLY - no system changes; Esc exits'
+    else
+      header='Network changes require YES confirmation; Esc exits'
+    fi
     choice="$(printf '%s\n' "${menu_options[@]}" | fzf \
       --no-multi --prompt="Select ${menu_role} action: " \
       --height=40% --reverse --border \
-      --header='Network changes require YES confirmation; Esc exits')" || return 0
+      --header="$header")" || return 0
+    if [[ -n "$demo_role" ]]; then
+      case "$choice" in
+        '[Exit]'|'') return 0 ;;
+        '[Status]')
+          printf 'DEMO (%s): simulated status; no live network information is read.\n' "$selected_role"
+          printf 'PAN: sample connected | Bluetooth: sample available | Wi-Fi: sample connected\n'
+          ;;
+        '[Wi-Fi Profiles]')
+          printf 'DEMO: sample saved profiles: iPhone-Hotspot, Recovery-AP\n'
+          ;;
+        *) printf 'DEMO: selected %s; no command or service action executed.\n' "$choice" ;;
+      esac
+      pause
+      continue
+    fi
     case "$choice" in
       '[Status]') status ;;
       '[PAN Autostart]') run_action configure_pan ;;
@@ -345,7 +371,7 @@ tui() {
 }
 usage() {
   cat <<USAGE
-Usage: pi-panctl {status|tui|pan configure|pan ensure|wifi profiles|wifi connect|bt info|
+Usage: pi-panctl {status|tui|demo pi|host|pan configure|pan ensure|wifi profiles|wifi connect|bt info|
                   recovery setup|recovery password|recovery start|recovery stop|
                   recovery enable|recovery disable|recovery legacy-disable|recovery check}
 Network mutations require root. Do not restart bluetooth, rfkill, or NetworkManager.
@@ -354,6 +380,7 @@ USAGE
 case "${1:-}" in
   status) status ;;
   tui) tui ;;
+  demo) [[ "${2:-}" == pi || "${2:-}" == host ]] || fail 'Usage: pi-panctl demo pi|host'; tui "$2" ;;
   pan)
     case "${2:-}" in configure) configure_pan ;; ensure) ensure_pan ;; *) usage; exit 2 ;; esac ;;
   wifi)

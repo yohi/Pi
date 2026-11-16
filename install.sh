@@ -9,14 +9,15 @@ PAN_PROFILE=''
 INSTALL_DEPS=1
 DRY_RUN=0
 OFFLINE_TEST=0
+DEMO=0
 
 usage() {
   cat <<USAGE
-Usage: sudo sh install.sh --role pi|host [--profile NAME] [--ref COMMIT_OR_TAG] [--no-install-deps] [--dry-run|--offline-test]
+Usage: sudo sh install.sh --role pi|host [--profile NAME] [--ref COMMIT_OR_TAG] [--no-install-deps] [--dry-run|--offline-test|--demo]
 Examples (after publishing the repository):
   curl -fsSL https://raw.githubusercontent.com/yohi/Pi/master/install.sh | sudo sh -s -- --role pi
   curl -fsSL https://raw.githubusercontent.com/yohi/Pi/master/install.sh | sudo sh -s -- --role host
-Offline: --dry-run checks downloads/integrity/syntax; --offline-test also runs mock network tests.
+Offline: --dry-run verifies files; --offline-test runs mock tests; --demo opens a read-only interactive TUI.
 Environment: PG_REPO=owner/repo, PG_REF=master (pin to a full commit hash for production).
 USAGE
 }
@@ -29,13 +30,21 @@ while [ "$#" -gt 0 ]; do
     --no-install-deps) INSTALL_DEPS=0; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --offline-test) OFFLINE_TEST=1; shift ;;
+    --demo) DEMO=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 [ "$ROLE" = pi ] || [ "$ROLE" = host ] || { echo 'Specify --role pi or --role host' >&2; exit 2; }
-[ "$DRY_RUN" -eq 0 ] || [ "$OFFLINE_TEST" -eq 0 ] || { echo 'Choose either --dry-run or --offline-test' >&2; exit 2; }
-[ "$(id -u)" -eq 0 ] || { echo 'Installer requires sudo/root' >&2; exit 1; }
+if [ "$((DRY_RUN + OFFLINE_TEST + DEMO))" -gt 1 ]; then
+  echo 'Choose only one of --dry-run, --offline-test or --demo.' >&2
+  exit 2
+fi
+# Demo operates only on staged code, so it needs no root privileges.
+if [ "$DEMO" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+  echo 'Installer requires sudo/root (except --demo).' >&2
+  exit 1
+fi
 printf '%s' "$REPOSITORY" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || { echo 'Invalid PG_REPO' >&2; exit 1; }
 printf '%s' "$INSTALL_REF" | grep -Eq '^[A-Za-z0-9_.-]+$' || { echo 'Invalid PG_REF/--ref' >&2; exit 1; }
 if [ -z "$PAN_PROFILE" ]; then
@@ -49,7 +58,7 @@ for req in curl sha256sum bash; do
   command -v "$req" >/dev/null 2>&1 || { echo "Missing required command: $req" >&2; exit 1; }
 done
 
-if [ "$DRY_RUN" -eq 0 ] && [ "$OFFLINE_TEST" -eq 0 ]; then
+if [ "$DRY_RUN" -eq 0 ] && [ "$OFFLINE_TEST" -eq 0 ] && [ "$DEMO" -eq 0 ]; then
   # Fail closed *before* apt, file installation, or network configuration.
   # Merely having /usr/bin/systemctl in a container is not sufficient.
   for req in nmcli bluetoothctl systemctl; do
@@ -102,6 +111,18 @@ if [ "$OFFLINE_TEST" -eq 1 ]; then
   exit 0
 fi
 if [ "$DRY_RUN" -eq 1 ]; then echo 'DRY RUN PASS: downloaded and verified; nothing was installed or activated.'; exit 0; fi
+if [ "$DEMO" -eq 1 ]; then
+  command -v fzf >/dev/null 2>&1 || { echo 'Demo needs fzf. Install it first; no packages were changed.' >&2; exit 1; }
+  # The caller may be `curl | sh`. Attach the child to the controlling TTY,
+  # rather than the pipe supplying the installer's source code.
+  if [ ! -t 1 ] || ! (: </dev/tty) 2>/dev/null; then
+    echo 'Demo requires an interactive TTY (e.g. docker run -it).' >&2
+    exit 1
+  fi
+  echo "DEMO: opening ${ROLE} TUI (no installation; no network/service operations)."
+  bash "$STAGE/bin/pi-panctl" demo "$ROLE" </dev/tty
+  exit $?
+fi
 
 if ! command -v fzf >/dev/null 2>&1 || { [ "$ROLE" = pi ] && ! command -v dnsmasq >/dev/null 2>&1; }; then
   if [ "$INSTALL_DEPS" -eq 0 ]; then

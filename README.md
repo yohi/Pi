@@ -48,6 +48,21 @@ curl -fsSL https://raw.githubusercontent.com/yohi/Pi/master/install.sh \
 
 `fzf`の対話画面、実機のBluetooth PAN、Wi-Fi APの起動やDHCP動作はこのモードでは検証できません。**Docker内で `sudo pi-panctl tui` を起動するものではありません。**
 
+### Dockerで実際のTUIを操作する（デモ）
+
+非systemdのDockerでも、**インストールせず**に `fzf` メニューを体験できます。Pi/Hostの役割別メニューを表示し、選んだ項目にはサンプル応答だけを返します。NetworkManager、Bluetooth、systemd、Wi-Fiプロファイルを参照・変更しません。実際の接続操作は検証できません。
+
+```sh
+# fzfとcurlが利用できる対話型コンテナ (docker run -it) で実行
+curl -fsSL https://raw.githubusercontent.com/yohi/Pi/master/install.sh \
+  | sh -s -- --role pi --demo
+# Hostの見た目を確認する場合
+curl -fsSL https://raw.githubusercontent.com/yohi/Pi/master/install.sh \
+  | sh -s -- --role host --demo
+```
+
+`--demo` はroot、Bluetooth、NetworkManager、systemdを必要とせず、GitHubから取得したファイルのハッシュ検証後に一時ディレクトリから起動します。`fzf` の事前インストールとTTYが必要です。`--demo` はローカルの既存 `pi-panctl` を更新しません。`--offline-test` は従来どおり自動モック試験を実行します。
+
 ## 2. 何が起こるか
 
 | 機能 | Pi | Ubuntu Host |
