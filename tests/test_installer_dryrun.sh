@@ -16,6 +16,8 @@ done
 [[ -n "$url" && -n "$dest" ]] || exit 2
 path="${url#*\/master\/}"
 cp "$MOCK_SOURCE/$path" "$dest"
+# curl -o creates a non-executable file even when the repository blob is executable.
+chmod 0644 "$dest"
 if [[ "${MOCK_TAMPER:-0}" == 1 && "$path" == 'bin/pi-panctl' ]]; then
   printf '# attacker modified content\n' >> "$dest"
 fi

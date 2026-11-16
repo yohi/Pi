@@ -93,6 +93,9 @@ bash -n "$STAGE/bin/pi-panctl" || { echo 'Invalid application script; no files i
 sh -n "$STAGE/uninstall.sh" || { echo 'Invalid uninstaller; no files installed.' >&2; exit 1; }
 bash -n "$STAGE/tests/test_guardian.sh" || { echo 'Invalid mock test; no files installed.' >&2; exit 1; }
 if [ "$OFFLINE_TEST" -eq 1 ]; then
+  # curl -o creates regular non-executable files. Restore only the verified
+  # staged test target's execute bit; do not change installed system files.
+  chmod 700 "$STAGE/bin/pi-panctl"
   echo 'OFFLINE TEST: running isolated nmcli/systemctl mocks (no real services or settings touched).'
   bash "$STAGE/tests/test_guardian.sh"
   echo 'OFFLINE TEST PASS: downloaded, SHA-256 verified, syntax checked, and mock scenarios passed.'
