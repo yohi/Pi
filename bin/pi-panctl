@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# pi-pan-guardian: network/Bluetooth recovery helpers for Pi Zero 2 W and Linux host.
+set -euo pipefail
+export LC_ALL=C
+
+CONFIG_DIR="${PG_CONFIG_DIR:-/etc/pi-pan-guardian}"
+STATE_DIR="${PG_STATE_DIR:-/run/pi-pan-guardian}"
+ROLE_FILE="$CONFIG_DIR/role"
+PROFILE_FILE="$CONFIG_DIR/pan-profile"
+AP_PROFILE="Pi-Zero2W-Recovery"
+WIFI_IF="wlan0"
+LEGACY_TIMER="pi-recovery-wifi.timer"
+
+log() { printf '[pi-pan-guardian] %s\n' "$*" >&2; }
+fail() { log "ERROR: $*"; exit 1; }
+need_root() { (( EUID == 0 )) || fail 'This action requires sudo/root.'; }
+need_pi() { [[ "$(role)" == pi ]] || fail 'Pi-only action.'; }
+need_host() { [[ "$(role)" == host ]] || fail 'Ubuntu-host-only action.'; }
+role() { [[ -r "$ROLE_FILE" ]] || fail "Role file missing: $ROLE_FILE"; cat "$ROLE_FILE"; }
+profile() {
+  [[ -r "$PROFILE_FILE" ]] || fail "Profile file missing: $PROFILE_FILE"
+  local value=''
+  IFS= read -r value < "$PROFILE_FILE" || [[ -n "$value" ]] || return 1
+  [[ -n "$value" ]] || fail 'Empty PAN profile.'
+  printf '%s\n' "$value"
+}
+nm_profile_exists() { nmcli -g connection.id connection show "$1" >/dev/null 2>&1; }
+profile_property() { nmcli -g "$2" connection show "$1" 2>/dev/null; }
+is_active() {
+  local uuid
+  uuid="$(profile_property "$1" connection.uuid)" || return 1
+  [[ -n "$uuid" ]] && nmcli -t -f UUID connection show --active 2>/dev/null | grep -Fxq "$uuid"
+}
+check_pan_profile() {
+  local p kind subtype
+  p="$(profile)"
+  nm_profile_exists "$p" || fail "PAN profile not found: $p. Existing profiles are left unchanged."
+  kind="$(profile_property "$p" connection.type)"
+  if [[ "$(role)" == pi ]]; then
+    # Existing Pi installation uses a bridge profile for btnap0; BlueZ NAP
+    # registration is configured independently and must already exist.
+    if [[ "$kind" == bridge ]]; then
+      [[ "$(profile_property "$p" connection.interface-name)" == btnap0 ]] || fail 'Expected Pi NAP bridge interface btnap0.'
+      return 0
+    fi
+    [[ "$kind" == bluetooth ]] || fail "Unexpected Pi PAN profile type: $kind"
+    subtype="$(profile_property "$p" bluetooth.type)"
+    [[ "$subtype" == nap ]] || fail "Pi Bluetooth profile must be nap, got: $subtype"
+  else
+    [[ "$kind" == bluetooth ]] || fail "Host PAN profile is not Bluetooth: $kind"
+    subtype="$(profile_property "$p" bluetooth.type)"
+    [[ "$subtype" == panu ]] || fail "Host Bluetooth profile must be panu, got: $subtype"
+  fi
+}
+check_ap_profile() {
+  nm_profile_exists "$AP_PROFILE" || fail "Recovery AP profile missing. Run: sudo pi-panctl recovery setup"
+  [[ "$(profile_property "$AP_PROFILE" connection.type)" == 802-11-wireless ]] || fail 'Recovery profile name is in use by a non-Wi-Fi profile.'
+  [[ "$(profile_property "$AP_PROFILE" 802-11-wireless.mode)" == ap ]] || fail 'Recovery profile is not in AP mode.'
+  local ifname
+  ifname="$(profile_property "$AP_PROFILE" connection.interface-name)"
+  [[ "$ifname" == "$WIFI_IF" || "$ifname" == '--' || -z "$ifname" ]] || fail 'Recovery profile uses an unexpected interface.'
+}
+wifi_current() { nmcli -g GENERAL.CONNECTION device show "$WIFI_IF" 2>/dev/null || true; }
+wifi_state() { nmcli -g GENERAL.STATE device show "$WIFI_IF" 2>/dev/null | grep -oE '^[0-9]+' || true; }
+legacy_conflict() {
+  systemctl is-enabled --quiet "$LEGACY_TIMER" 2>/dev/null || systemctl is-active --quiet "$LEGACY_TIMER" 2>/dev/null
+}
+check_legacy() {
+  ! legacy_conflict || fail "Legacy $LEGACY_TIMER is enabled/active. Explicitly retire it before enabling the new recovery timer."
+}
+
+status() {
+  printf '=== pi-pan-guardian (%s) ===\n' "$(role)"
+  printf 'PAN profile: %s\n' "$(profile)"
+  nmcli -f DEVICE,TYPE,STATE,CONNECTION device status || true
+  printf '\n=== PAN ===\n'
+  nmcli -f connection.id,connection.autoconnect,connection.autoconnect-retries connection show "$(profile)" 2>/dev/null || true
+  printf '\n=== Bluetooth ===\n'
+  bluetoothctl show 2>/dev/null | grep -E 'Controller |Powered:|Discoverable:|Pairable:' || true
+  printf '\n=== Timers ===\n'
+  systemctl is-enabled pi-pan-guardian-pan.timer 2>/dev/null || true
+  if [[ "$(role)" == pi ]]; then
+    printf 'Wi-Fi: %s (state %s)\n' "$(wifi_current)" "$(wifi_state)"
+    systemctl is-enabled pi-pan-guardian-recovery.timer 2>/dev/null || true
+    [[ ! -d "$STATE_DIR" ]] || ls -l "$STATE_DIR" 2>/dev/null || true
+  fi
+}
+
+configure_pan() {
+  need_root
+  check_pan_profile
+  local p
+  p="$(profile)"
+  # Do not create/edit address, bridge, security, or other PAN properties.
+  nmcli connection modify "$p" connection.autoconnect yes connection.autoconnect-retries 0
+  systemctl enable bluetooth.service NetworkManager.service >/dev/null
+  systemctl enable --now pi-pan-guardian-pan.timer >/dev/null
+  log "PAN autoconnect and watchdog timer enabled for $p. Existing active links were not restarted."
+}
+ensure_pan() {
+  need_root
+  check_pan_profile
+  local p
+  p="$(profile)"
+  is_active "$p" && return 0
+  systemctl is-active --quiet NetworkManager.service || { log 'NetworkManager is not running. No restart attempted.'; return 0; }
+  systemctl is-active --quiet bluetooth.service || { log 'Bluetooth is not running. No restart attempted.'; return 0; }
+  # One activation attempt per timer tick. Never reset Bluetooth or NM.
+  if ! nmcli --wait 18 connection up "$p" >/dev/null; then
+    log "PAN activation unavailable for $p; will retry on next timer tick."
+  else
+    log "PAN activated: $p"
+  fi
+}
+
+ap_setup() {
+  need_root; need_pi
+  if nm_profile_exists "$AP_PROFILE"; then
+    check_ap_profile
+    log "Existing AP profile '$AP_PROFILE' preserved (password and all settings unchanged)."
+    return 0
+  fi
+  [[ ! -e /etc/NetworkManager/system-connections/pi-pan-guardian-recovery.nmconnection ]] || fail 'Recovery keyfile already exists; refusing overwrite.'
+  command -v dnsmasq >/dev/null || fail 'Install dnsmasq-base first; recovery AP needs DHCP.'
+  command -v od >/dev/null || fail 'od is required to generate a random PSK.'
+  local secret uuid tmp target
+  secret="$(od -An -N 12 -tx1 /dev/urandom | tr -d ' \n')"
+  uuid="$(cat /proc/sys/kernel/random/uuid)"
+  [[ "$secret" =~ ^[a-f0-9]{24}$ && "$uuid" =~ ^[a-f0-9-]{36}$ ]] || fail 'Failed to generate credentials.'
+  # Direct keyfile write prevents the PSK appearing in process arguments.
+  tmp="$(mktemp "$CONFIG_DIR/.recovery.XXXXXX")"
+  chmod 600 "$tmp"
+  cat > "$tmp" <<KEYFILE
+[connection]
+id=$AP_PROFILE
+uuid=$uuid
+type=wifi
+interface-name=$WIFI_IF
+autoconnect=false
+
+[wifi]
+mode=ap
+ssid=$AP_PROFILE
+band=bg
+channel=6
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=$secret
+
+[ipv4]
+method=shared
+address1=192.168.77.1/24
+
+[ipv6]
+method=disabled
+KEYFILE
+  target='/etc/NetworkManager/system-connections/pi-pan-guardian-recovery.nmconnection'
+  install -m 600 "$tmp" "$target"
+  rm -f "$tmp"
+  if ! nmcli connection load "$target"; then
+    rm -f "$target" # Newly created file only
+    fail 'Could not load recovery AP profile; new file was removed.'
+  fi
+  log "Recovery AP created but NOT activated. SSID: $AP_PROFILE, address: 192.168.77.1"
+  log "Password generated and stored root-only; reveal with 'sudo pi-panctl recovery password'."
+}
+ap_password() {
+  need_root; need_pi; check_ap_profile
+  nmcli --show-secrets -g 802-11-wireless-security.psk connection show "$AP_PROFILE"
+}
+ap_start() {
+  need_root; need_pi; check_ap_profile; check_legacy
+  local active state
+  active="$(wifi_current)"; state="$(wifi_state)"
+  if [[ "$active" == "$AP_PROFILE" ]]; then return 0; fi
+  [[ "$state" == 30 ]] || fail "Wi-Fi not disconnected (state=$state, profile=$active). Refusing to replace active or busy Wi-Fi."
+  nmcli --wait 25 connection up "$AP_PROFILE" ifname "$WIFI_IF"
+}
+ap_stop() {
+  need_root; need_pi; check_ap_profile
+  local peer="${SSH_CONNECTION%% *}"
+  [[ ! "$peer" =~ ^192\.168\.77\. ]] || fail 'SSH seems to be via recovery AP. Refusing to sever the only path.'
+  if [[ "$(wifi_current)" == "$AP_PROFILE" ]]; then
+    nmcli --wait 15 connection down "$AP_PROFILE"
+  else
+    log 'Recovery AP is not active.'
+  fi
+}
+ap_auto_enable() {
+  need_root; need_pi; check_ap_profile; check_legacy
+  systemctl enable --now pi-pan-guardian-recovery.timer >/dev/null
+  log 'Automatic recovery enabled. AP activates only after prolonged WLAN disconnect.'
+  log 'While AP is active, a single wlan0 cannot also join an iPhone hotspot. Stop AP deliberately to return to client mode.'
+}
+legacy_disable() {
+  need_root; need_pi
+  if legacy_conflict; then
+    systemctl disable --now "$LEGACY_TIMER" >/dev/null
+    log "Disabled legacy recovery timer: $LEGACY_TIMER. Profile and active AP, if any, were preserved."
+  else
+    log 'Legacy recovery timer is not active or enabled.'
+  fi
+}
+ap_auto_disable() {
+  need_root; need_pi
+  systemctl disable --now pi-pan-guardian-recovery.timer >/dev/null
+  log 'Automatic recovery timer disabled. An already active AP is preserved until explicitly stopped.'
+}
+
+ap_check() {
+  need_root; need_pi
+  nm_profile_exists "$AP_PROFILE" || return 0
+  check_ap_profile
+  # Never compete with the previous recovery timer.
+  if legacy_conflict; then log 'Legacy recovery timer conflict: no action.'; return 0; fi
+  local active state stampfile now start
+  active="$(wifi_current)"; state="$(wifi_state)"
+  stampfile="$STATE_DIR/wlan-disconnected-since"
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"
+  if [[ "$active" == "$AP_PROFILE" ]]; then
+    rm -f "$stampfile"
+    return 0
+  fi
+  # Only explicit disconnected state is eligible, not connecting/unmanaged/unavailable.
+  if [[ "$state" != 30 ]]; then
+    rm -f "$stampfile"
+    return 0
+  fi
+  now="$(date +%s)"
+  if [[ ! -f "$stampfile" ]]; then
+    printf '%s\n' "$now" > "$stampfile"
+    chmod 600 "$stampfile"
+    return 0
+  fi
+  IFS= read -r start < "$stampfile" || start=''
+  if [[ ! "$start" =~ ^[0-9]+$ || "$now" -lt "$start" ]]; then
+    printf '%s\n' "$now" > "$stampfile"
+    return 0
+  fi
+  (( now - start >= 90 )) || return 0
+  # One last check before activation, preventing most STA/AP races.
+  [[ "$(wifi_state)" == 30 ]] || { rm -f "$stampfile"; return 0; }
+  if ! nmcli --wait 25 connection up "$AP_PROFILE" ifname "$WIFI_IF" >/dev/null; then
+    log 'Recovery AP activation failed; next timer tick will retry if Wi-Fi is still disconnected.'
+  else
+    rm -f "$stampfile"
+    log "Recovery AP activated: $AP_PROFILE"
+  fi
+}
+
+wifi_profiles() {
+  nmcli -f NAME,UUID,TYPE,AUTOCONNECT connection show | grep -E '(^NAME|wifi|wireless)' || true
+}
+wireless_connect() {
+  need_root; need_pi
+  command -v fzf >/dev/null || fail 'fzf is required for profile selection.'
+  local picked
+  picked="$(nmcli -g NAME connection show | fzf --no-multi --prompt='Saved Wi-Fi profile> ' --height=70% --border)" || return 0
+  [[ -n "$picked" ]] || return 0
+  [[ "$(profile_property "$picked" connection.type)" == 802-11-wireless ]] || fail 'Selected profile is not Wi-Fi.'
+  [[ "$picked" != "$AP_PROFILE" ]] || fail 'Use recovery start for the recovery AP.'
+  log "Connecting wlan0 using existing profile: $picked (may stop the recovery AP)."
+  nmcli --ask --wait 45 connection up "$picked" ifname "$WIFI_IF"
+}
+
+bt_info() {
+  bluetoothctl show || true
+  printf '\n=== Paired devices ===\n'
+  bluetoothctl devices Paired || true
+}
+
+confirm() {
+  local answer
+  printf 'Proceed? Type YES to confirm: ' >&2
+  IFS= read -r answer </dev/tty || return 1
+  [[ "$answer" == YES ]]
+}
+run_action() {
+  if confirm; then
+    ( "$@" ) || log "Action failed; no automatic retry."
+  else
+    log "Cancelled."
+  fi
+}
+pause() { printf '\nPress Enter to return to menu...' >&2; read -r _ </dev/tty || true; }
+tui() {
+  need_root
+  command -v fzf >/dev/null || fail 'fzf is not installed.'
+  [[ -t 0 && -t 1 ]] || fail 'TUI requires an interactive terminal.'
+  local choices selected
+  while :; do
+    if [[ "$(role)" == pi ]]; then
+      choices=$'Status (read only)\nPAN: enable autostart/watchdog\nPAN: activate now\nRecovery AP: create/adopt profile\nRecovery AP: disable legacy recovery timer (explicit migration)\nRecovery AP: enable auto fallback\nRecovery AP: disable auto fallback\nRecovery AP: start (only if WLAN disconnected)\nRecovery AP: stop\nRecovery AP: show password\nWi-Fi: list saved profiles\nWi-Fi: connect saved profile\nBluetooth: controller & paired devices\nLogs: timers and NetworkManager\nExit'
+    else
+      choices=$'Status (read only)\nPAN: enable autostart/watchdog\nPAN: activate now\nBluetooth: controller & paired devices\nLogs: timers and NetworkManager\nExit'
+    fi
+    selected="$(printf '%s\n' "$choices" | fzf --no-multi --height=90% --border --prompt='pi-pan-guardian> ' --header='Explicit approval for network changes; Esc exits')" || return 0
+    case "$selected" in
+      'Status (read only)') status ;;
+      'PAN: enable autostart/watchdog') run_action configure_pan ;;
+      'PAN: activate now') run_action ensure_pan ;;
+      'Recovery AP: create/adopt profile') run_action ap_setup ;;
+      'Recovery AP: disable legacy recovery timer (explicit migration)') run_action legacy_disable ;;
+      'Recovery AP: enable auto fallback') run_action ap_auto_enable ;;
+      'Recovery AP: disable auto fallback') run_action ap_auto_disable ;;
+      'Recovery AP: start (only if WLAN disconnected)') run_action ap_start ;;
+      'Recovery AP: stop') run_action ap_stop ;;
+      'Recovery AP: show password') run_action ap_password ;;
+      'Wi-Fi: list saved profiles') wifi_profiles ;;
+      'Wi-Fi: connect saved profile') run_action wireless_connect ;;
+      'Bluetooth: controller & paired devices') bt_info ;;
+      'Logs: timers and NetworkManager') journalctl -u pi-pan-guardian-pan.service -u pi-pan-guardian-recovery.service -u NetworkManager -n 70 --no-pager || true ;;
+      'Exit'|'') return 0 ;;
+    esac
+    pause
+  done
+}
+
+usage() {
+  cat <<USAGE
+Usage: pi-panctl {status|tui|pan configure|pan ensure|wifi profiles|wifi connect|bt info|
+                  recovery setup|recovery password|recovery start|recovery stop|
+                  recovery enable|recovery disable|recovery legacy-disable|recovery check}
+Network mutations require root. Do not restart bluetooth, rfkill, or NetworkManager.
+USAGE
+}
+case "${1:-}" in
+  status) status ;;
+  tui) tui ;;
+  pan)
+    case "${2:-}" in configure) configure_pan ;; ensure) ensure_pan ;; *) usage; exit 2 ;; esac ;;
+  wifi)
+    case "${2:-}" in profiles) wifi_profiles ;; connect) wireless_connect ;; *) usage; exit 2 ;; esac ;;
+  bt)
+    case "${2:-}" in info) bt_info ;; *) usage; exit 2 ;; esac ;;
+  recovery)
+    case "${2:-}" in setup) ap_setup ;; password) ap_password ;; start) ap_start ;; stop) ap_stop ;;
+      enable) ap_auto_enable ;; disable) ap_auto_disable ;; legacy-disable) legacy_disable ;; check) ap_check ;; *) usage; exit 2 ;; esac ;;
+  *) usage; exit 2 ;;
+esac

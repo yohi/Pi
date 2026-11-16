@@ -1,0 +1,10 @@
+[Unit]
+Description=PAN Guardian - ensure saved Bluetooth PAN connection
+Wants=NetworkManager.service bluetooth.service
+After=NetworkManager.service bluetooth.service
+ConditionPathExists=/etc/pi-pan-guardian/role
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pi-panctl pan ensure
+TimeoutStartSec=40s

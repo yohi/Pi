@@ -1,0 +1,11 @@
+[Unit]
+Description=PAN Guardian - check Wi-Fi recovery AP status periodically
+
+[Timer]
+OnBootSec=120s
+OnUnitInactiveSec=45s
+AccuracySec=5s
+Unit=pi-pan-guardian-recovery.service
+
+[Install]
+WantedBy=timers.target

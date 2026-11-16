@@ -1,0 +1,10 @@
+[Unit]
+Description=PAN Guardian - check Wi-Fi fallback recovery access point
+Wants=NetworkManager.service
+After=NetworkManager.service
+ConditionPathExists=/etc/pi-pan-guardian/role
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pi-panctl recovery check
+TimeoutStartSec=40s
