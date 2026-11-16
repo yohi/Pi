@@ -81,6 +81,10 @@ sudo nmcli --ask connection up 'YusukeOhi_iPhone17' ifname wlan0
 
 `pi-recovery-wifi.timer` という旧システムが `enabled` または `active` の場合は競合防止のため、このツールは新しいAP自動監視を**拒否**します。旧タイマーを自動削除しません。移行すると判断した場合のみ、TUI の **「disable legacy recovery timer (explicit migration)」** または `sudo pi-panctl recovery legacy-disable` を選び、明示的に旧タイマーだけを停止・無効化できます。旧プロファイル・既存APは維持します。
 
+### TUI表示スタイル
+
+`sudo pi-panctl tui` のメニューは [dotfiles-term の `tmux-selector.sh`](https://github.com/yohi/dotfiles-term/blob/master/tmux/tmux-selector.sh) に合わせ、角括弧付きのアクション名（`[Status]`、`[PAN Activate]` など）、`fzf --height=40% --reverse --border`、役割ごとの `Select Pi action: ` / `Select Host action: ` プロンプトを使います。Escで終了し、設定変更は従来どおり `YES` の明示確認が必要です。無線サービスの制御ロジックや役割別メニューの権限制限は変更していません。
+
 ### 主なCLI
 
 ```sh

@@ -256,7 +256,8 @@ wireless_connect() {
   need_root; need_pi
   command -v fzf >/dev/null || fail 'fzf is required for profile selection.'
   local picked
-  picked="$(nmcli -g NAME connection show | fzf --no-multi --prompt='Saved Wi-Fi profile> ' --height=70% --border)" || return 0
+  # Match the fzf selector style used by yohi/dotfiles-term/tmux/tmux-selector.sh.
+  picked="$(nmcli -g NAME connection show | fzf --no-multi --prompt='Select Wi-Fi profile: ' --height=40% --reverse --border)" || return 0
   [[ -n "$picked" ]] || return 0
   [[ "$(profile_property "$picked" connection.type)" == 802-11-wireless ]] || fail 'Selected profile is not Wi-Fi.'
   [[ "$picked" != "$AP_PROFILE" ]] || fail 'Use recovery start for the recovery AP.'
@@ -288,35 +289,60 @@ tui() {
   need_root
   command -v fzf >/dev/null || fail 'fzf is not installed.'
   [[ -t 0 && -t 1 ]] || fail 'TUI requires an interactive terminal.'
-  local choices selected
+  local -a menu_options
+  local choice menu_role
+  # Follow dotfiles-term's tmux-selector format: a Bash array of bracketed
+  # actions, a 40%-height reverse fzf list, a border and an explicit prompt.
   while :; do
+    menu_options=(
+      '[Status]'
+      '[PAN Autostart]'
+      '[PAN Activate]'
+    )
+    menu_role='Host'
     if [[ "$(role)" == pi ]]; then
-      choices=$'Status (read only)\nPAN: enable autostart/watchdog\nPAN: activate now\nRecovery AP: create/adopt profile\nRecovery AP: disable legacy recovery timer (explicit migration)\nRecovery AP: enable auto fallback\nRecovery AP: disable auto fallback\nRecovery AP: start (only if WLAN disconnected)\nRecovery AP: stop\nRecovery AP: show password\nWi-Fi: list saved profiles\nWi-Fi: connect saved profile\nBluetooth: controller & paired devices\nLogs: timers and NetworkManager\nExit'
-    else
-      choices=$'Status (read only)\nPAN: enable autostart/watchdog\nPAN: activate now\nBluetooth: controller & paired devices\nLogs: timers and NetworkManager\nExit'
+      menu_role='Pi'
+      menu_options+=(
+        '[Recovery AP Setup]'
+        '[Recovery AP Legacy Disable]'
+        '[Recovery AP Enable]'
+        '[Recovery AP Disable]'
+        '[Recovery AP Start]'
+        '[Recovery AP Stop]'
+        '[Recovery AP Password]'
+        '[Wi-Fi Profiles]'
+        '[Wi-Fi Connect]'
+      )
     fi
-    selected="$(printf '%s\n' "$choices" | fzf --no-multi --height=90% --border --prompt='pi-pan-guardian> ' --header='Explicit approval for network changes; Esc exits')" || return 0
-    case "$selected" in
-      'Status (read only)') status ;;
-      'PAN: enable autostart/watchdog') run_action configure_pan ;;
-      'PAN: activate now') run_action ensure_pan ;;
-      'Recovery AP: create/adopt profile') run_action ap_setup ;;
-      'Recovery AP: disable legacy recovery timer (explicit migration)') run_action legacy_disable ;;
-      'Recovery AP: enable auto fallback') run_action ap_auto_enable ;;
-      'Recovery AP: disable auto fallback') run_action ap_auto_disable ;;
-      'Recovery AP: start (only if WLAN disconnected)') run_action ap_start ;;
-      'Recovery AP: stop') run_action ap_stop ;;
-      'Recovery AP: show password') run_action ap_password ;;
-      'Wi-Fi: list saved profiles') wifi_profiles ;;
-      'Wi-Fi: connect saved profile') run_action wireless_connect ;;
-      'Bluetooth: controller & paired devices') bt_info ;;
-      'Logs: timers and NetworkManager') journalctl -u pi-pan-guardian-pan.service -u pi-pan-guardian-recovery.service -u NetworkManager -n 70 --no-pager || true ;;
-      'Exit'|'') return 0 ;;
+    menu_options+=(
+      '[Bluetooth Devices]'
+      '[Logs]'
+      '[Exit]'
+    )
+    choice="$(printf '%s\n' "${menu_options[@]}" | fzf \
+      --no-multi --prompt="Select ${menu_role} action: " \
+      --height=40% --reverse --border \
+      --header='Network changes require YES confirmation; Esc exits')" || return 0
+    case "$choice" in
+      '[Status]') status ;;
+      '[PAN Autostart]') run_action configure_pan ;;
+      '[PAN Activate]') run_action ensure_pan ;;
+      '[Recovery AP Setup]') run_action ap_setup ;;
+      '[Recovery AP Legacy Disable]') run_action legacy_disable ;;
+      '[Recovery AP Enable]') run_action ap_auto_enable ;;
+      '[Recovery AP Disable]') run_action ap_auto_disable ;;
+      '[Recovery AP Start]') run_action ap_start ;;
+      '[Recovery AP Stop]') run_action ap_stop ;;
+      '[Recovery AP Password]') run_action ap_password ;;
+      '[Wi-Fi Profiles]') wifi_profiles ;;
+      '[Wi-Fi Connect]') run_action wireless_connect ;;
+      '[Bluetooth Devices]') bt_info ;;
+      '[Logs]') journalctl -u pi-pan-guardian-pan.service -u pi-pan-guardian-recovery.service -u NetworkManager -n 70 --no-pager || true ;;
+      '[Exit]'|'') return 0 ;;
     esac
     pause
   done
 }
-
 usage() {
   cat <<USAGE
 Usage: pi-panctl {status|tui|pan configure|pan ensure|wifi profiles|wifi connect|bt info|
