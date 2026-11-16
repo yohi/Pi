@@ -33,6 +33,21 @@ sudo sh install.sh --role pi
 
 リポジトリには全ファイルが必要です。インストーラはGitHubの `MANIFEST.sha256` でファイル群の整合性を確認した後、`/usr/local/sbin/pi-panctl`、アンインストーラと4件の systemd unit をインストールします。必要に応じて `fzf` と `dnsmasq-base` を `apt-get` で導入します。`NetworkManager`/`bluetooth` は既存状態を前提とし、勝手に再インストール・再起動しません。
 
+### Docker / CI でのオフライン検証
+
+Dockerコンテナは通常、`systemd` がPID 1として稼働していないため、**通常の `--role pi` インストールは事前検査で停止**します。`systemctl` コマンドが存在するだけでは十分ではありません。依存パッケージを導入したり、`/etc` や `/usr/local/sbin` を変更したりする前に停止します。
+
+コンテナ内では、インストールせずに以下を実行してください。**NetworkManager・BlueZ・systemdの起動、Bluetoothデバイス、実Wi-Fi機器、fzfの導入は不要**です。
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yohi/Pi/master/install.sh \
+  | sh -s -- --role pi --offline-test
+```
+
+`--offline-test` は配布ファイルのSHA-256検証、シェル構文確認、NetworkManager・systemctlを模擬した8ケースのテストだけを行います。実ネットワークやサービス、インストール先は変更しません（root権限で実行する現行仕様）。`--role host --offline-test` でも同じ模擬テストを実行できます。`--dry-run` は取得・ハッシュ・構文検証のみ行います。
+
+`fzf`の対話画面、実機のBluetooth PAN、Wi-Fi APの起動やDHCP動作はこのモードでは検証できません。**Docker内で `sudo pi-panctl tui` を起動するものではありません。**
+
 ## 2. 何が起こるか
 
 | 機能 | Pi | Ubuntu Host |
@@ -108,7 +123,7 @@ bash -n bin/pi-panctl
 sh -n install.sh
 sh -n uninstall.sh
 bash tests/test_guardian.sh
-bash tests/test_installer_dryrun.sh
+bash tests/test_installer_dryrun.sh  # --offline-test / non-systemd fail-fast を含む
 sha256sum -c MANIFEST.sha256
 ```
 
