@@ -16,6 +16,19 @@ cat > "$tmp/mock-bin/nmcli" <<'SH'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MOCK_LOG"
 case "$*" in
+  '-g UUID connection show') printf '%s\n' '11111111-1111-1111-1111-111111111111' '22222222-2222-2222-2222-222222222222' '33333333-3333-3333-3333-333333333333' '44444444-4444-4444-4444-444444444444' ;;
+  '-g connection.type connection show 11111111-1111-1111-1111-111111111111') echo bridge ;;
+  '-g connection.type connection show 22222222-2222-2222-2222-222222222222') echo bluetooth ;;
+  '-g connection.type connection show 33333333-3333-3333-3333-333333333333') echo 802-11-wireless ;;
+  '-g connection.id connection show 33333333-3333-3333-3333-333333333333') echo 'My:Wi-Fi' ;;
+  '-g 802-11-wireless.mode connection show 33333333-3333-3333-3333-333333333333') echo infrastructure ;;
+  '-g connection.type connection show 44444444-4444-4444-4444-444444444444') echo 802-11-wireless ;;
+  '-g connection.id connection show 44444444-4444-4444-4444-444444444444') echo Pi-Zero2W-Recovery ;;
+  '-g 802-11-wireless.mode connection show 44444444-4444-4444-4444-444444444444') echo ap ;;
+  '-t --escape yes -f SSID,BSSID,CHAN,FREQ,SIGNAL,SECURITY device wifi list ifname wlan0 --rescan yes')
+    printf '%s\n' 'My\:Wi-Fi:11\:22\:33\:44\:55\:66:6:2437 MHz:90:WPA2' 'My\:Wi-Fi:AA\:BB\:CC\:DD\:EE\:FF:11:2462 MHz:55:WPA2 WPA3' ':99\:99\:99\:99\:99\:99:1:2412 MHz:15:--'
+    ;;
+  *' device wifi connect '*) exit 0 ;;
   '-g connection.id connection show pi-bt-pan') echo pi-bt-pan ;;
   '-g connection.id connection show pi-zero2w-pan') echo pi-zero2w-pan ;;
   '-g NAME connection show') echo YusukeOhi_iPhone17 ;;
@@ -146,3 +159,63 @@ else
 fi
 
 echo 'All 8 mock scenarios passed.'
+
+# Wi-Fi list must never include PAN, lo or other non-Wi-Fi profiles.
+printf 'pi\n' > "$tmp/config/role"
+"$bin" wifi profiles > "$tmp/wifi-profiles.out"
+grep -q 'My:Wi-Fi' "$tmp/wifi-profiles.out"
+grep -q 'Pi-Zero2W-Recovery' "$tmp/wifi-profiles.out"
+! grep -q 'pi-bt-pan' "$tmp/wifi-profiles.out"
+! grep -q 'pi-zero2w-pan' "$tmp/wifi-profiles.out"
+echo 'PASS saved Wi-Fi list excludes Bluetooth PAN'
+
+cat > "$tmp/mock-bin/fzf" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$MOCK_FZF_ARGS"
+cat > "$MOCK_FZF_MENU"
+case "${MOCK_FZF_SELECTION:-first}" in
+  cancel) exit 130 ;;
+  second) sed -n '2p' "$MOCK_FZF_MENU" ;;
+  *) sed -n '1p' "$MOCK_FZF_MENU" ;;
+esac
+SH
+chmod +x "$tmp/mock-bin/fzf"
+export MOCK_FZF_MENU="$tmp/fzf-menu" MOCK_FZF_ARGS="$tmp/fzf-args"
+export MOCK_WIFI_PROFILE='YusukeOhi_iPhone17'
+: > "$MOCK_LOG"
+if command -v script >/dev/null 2>&1; then
+  # The scan list is based on actual AP BSSIDs, not saved connection names.
+  # Declining confirmation must never call the mutating nmcli command.
+  printf 'NO\n' | script -q -e -c "'$bin' wifi scan" /dev/null > "$tmp/wifi-scan.out" 2>&1
+  grep -Fq $'11:22:33:44:55:66\tMy:Wi-Fi\t6\t2437 MHz\t90\tWPA2' "$MOCK_FZF_MENU"
+  grep -Fq $'AA:BB:CC:DD:EE:FF\tMy:Wi-Fi\t11\t2462 MHz\t55\tWPA2 WPA3' "$MOCK_FZF_MENU"
+  ! grep -q 'pi-bt-pan' "$MOCK_FZF_MENU"
+  ! grep -q 'device wifi connect' "$MOCK_LOG"
+  echo 'PASS visible Wi-Fi BSSID/SSID scan and NO cancellation'
+
+  # One confirmation selects the exact BSSID, preserving the colon in the SSID.
+  : > "$MOCK_LOG"
+  printf 'YES\n' | MOCK_FZF_SELECTION=second script -q -e -c "'$bin' wifi scan" /dev/null > "$tmp/wifi-connect.out" 2>&1
+  grep -Fq 'device wifi connect My:Wi-Fi ifname wlan0 bssid AA:BB:CC:DD:EE:FF' "$MOCK_LOG"
+  echo 'PASS scanned Wi-Fi target uses selected BSSID'
+
+  # Saved Wi-Fi selector is limited to infrastructure profiles; uses UUID.
+  : > "$MOCK_LOG"
+  printf 'NO\n' | script -q -e -c "'$bin' wifi connect" /dev/null > "$tmp/wifi-saved.out" 2>&1
+  ! grep -q 'Pi-Zero2W-Recovery' "$MOCK_FZF_MENU"
+  grep -Fq '33333333-3333-3333-3333-333333333333' "$MOCK_FZF_MENU"
+  ! grep -q ' connection up ' "$MOCK_LOG"
+  echo 'PASS saved Wi-Fi selector excludes recovery AP and respects NO'
+else
+  echo 'SKIP Wi-Fi confirmation pseudo-terminal tests: script(1) unavailable'
+fi
+
+# Active Recovery AP must not be taken down implicitly.
+export MOCK_WIFI_PROFILE='Pi-Zero2W-Recovery'
+: > "$MOCK_LOG"
+if "$bin" wifi scan > "$tmp/wifi-denied.out" 2>&1; then
+  echo 'FAIL scan must refuse to disrupt active recovery AP' >&2; exit 1
+fi
+! grep -q 'device wifi connect' "$MOCK_LOG"
+! grep -q -- '--rescan yes' "$MOCK_LOG"
+echo 'PASS active recovery AP protected'

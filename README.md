@@ -100,6 +100,9 @@ sudo nmcli --ask connection up 'YusukeOhi_iPhone17' ifname wlan0
 
 `sudo pi-panctl tui` のメニューは [dotfiles-term の `tmux-selector.sh`](https://github.com/yohi/dotfiles-term/blob/master/tmux/tmux-selector.sh) に合わせ、角括弧付きのアクション名（`[Status]`、`[PAN Activate]` など）、`fzf --height=40% --reverse --border`、役割ごとの `Select Pi action: ` / `Select Host action: ` プロンプトを使います。Escで終了し、設定変更は従来どおり `YES` の明示確認が必要です。無線サービスの制御ロジックや役割別メニューの権限制限は変更していません。
 
+
+TUIのWi-Fi項目は `[Wi-Fi Scan & Connect]`（受信できるSSID・BSSID・チャンネル・周波数・信号強度・セキュリティを表示）と `[Saved Wi-Fi Profiles]`（登録済みWi-Fiのみ表示）、`[Wi-Fi Connect Saved]`（登録済みWi-FiをUUIDで選択）に分離しています。接続先選択後に `YES` を要求し、復旧APが動作中なら暗黙に停止せず接続処理を拒否します。Bluetooth PANや既存NetworkManagerサービスは操作しません。
+
 ### 主なCLI
 
 ```sh
@@ -107,8 +110,9 @@ sudo pi-panctl tui
 pi-panctl status
 sudo pi-panctl pan configure
 sudo pi-panctl pan ensure
-pi-panctl wifi profiles
-sudo pi-panctl wifi connect  # fzfで保存済みWi-Fiから選択
+pi-panctl wifi profiles          # 保存済みWi-Fiのみ表示
+sudo pi-panctl wifi connect     # 保存済みWi-Fiから選択、接続前にYES確認
+sudo pi-panctl wifi scan        # 周辺SSID/BSSIDをスキャン・選択、接続前にYES確認
 pi-panctl bt info
 sudo pi-panctl recovery start   # wlan0切断中に限る
 sudo pi-panctl recovery stop

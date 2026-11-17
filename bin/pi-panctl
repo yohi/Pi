@@ -249,20 +249,119 @@ ap_check() {
   fi
 }
 
-wifi_profiles() {
-  nmcli -f NAME,UUID,TYPE,AUTOCONNECT connection show | grep -E '(^NAME|wifi|wireless)' || true
+# Parse NetworkManager's escaped terse records without breaking BSSID colons
+# or SSIDs containing spaces, colons or backslashes.
+nmcli_split_fields() {
+  local line="$1" ch field='' escaped=0 i
+  NMCLI_FIELDS=()
+  for ((i=0; i<${#line}; i++)); do
+    ch="${line:i:1}"
+    if (( escaped )); then
+      field+="$ch"
+      escaped=0
+    elif [[ "$ch" == '\' ]]; then
+      escaped=1
+    elif [[ "$ch" == ':' ]]; then
+      NMCLI_FIELDS+=("$field")
+      field=''
+    else
+      field+="$ch"
+    fi
+  done
+  (( ! escaped )) || return 1
+  NMCLI_FIELDS+=("$field")
 }
+
+# UUID first, so duplicate names are unambiguous; exclude non-Wi-Fi types.
+saved_wifi_rows() {
+  local uuids uuid kind name mode
+  uuids="$(nmcli -g UUID connection show)" || return 1
+  while IFS= read -r uuid; do
+    [[ "$uuid" =~ ^[[:xdigit:]-]{36}$ ]] || continue
+    kind="$(profile_property "$uuid" connection.type)" || continue
+    [[ "$kind" == 802-11-wireless ]] || continue
+    name="$(profile_property "$uuid" connection.id)" || continue
+    mode="$(profile_property "$uuid" 802-11-wireless.mode)" || continue
+    [[ -n "$name" && "$name" != *$'\t'* && "$name" != *$'\n'* && "$name" != *$'\r'* ]] || continue
+    printf '%s\t%s\t%s\n' "$uuid" "$name" "$mode"
+  done <<< "$uuids"
+}
+
+wifi_profiles() {
+  need_pi
+  printf 'UUID\tPROFILE\tMODE\n'
+  saved_wifi_rows
+}
+
+# Snapshot the visible access points, never connection profiles.
+# Rows: BSSID, SSID, channel, frequency, signal, security.
+visible_wifi_rows() {
+  local scan row ssid bssid chan freq signal security
+  scan="$(nmcli -t --escape yes -f SSID,BSSID,CHAN,FREQ,SIGNAL,SECURITY \
+    device wifi list ifname "$WIFI_IF" --rescan yes)" || return 1
+  while IFS= read -r row; do
+    nmcli_split_fields "$row" || continue
+    (( ${#NMCLI_FIELDS[@]} == 6 )) || continue
+    ssid="${NMCLI_FIELDS[0]}"; bssid="${NMCLI_FIELDS[1]}"
+    chan="${NMCLI_FIELDS[2]}"; freq="${NMCLI_FIELDS[3]}"
+    signal="${NMCLI_FIELDS[4]}"; security="${NMCLI_FIELDS[5]}"
+    [[ -n "$ssid" && "$ssid" != '--' && "$ssid" != *$'\t'* && "$ssid" != *$'\r'* ]] || continue
+    [[ "$bssid" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]] || continue
+    [[ "$chan" =~ ^[0-9]+$ && "$signal" =~ ^[0-9]+$ ]] || continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$bssid" "$ssid" "$chan" "$freq" "$signal" "$security"
+  done <<< "$scan"
+}
+
+# Request approval after identifying the exact Wi-Fi target.
+confirm_wifi_switch() {
+  local target="$1" current
+  current="$(wifi_current)"
+  [[ "$current" != "$AP_PROFILE" ]] || fail \
+    'Recovery AP is active. Stop it explicitly after verifying Bluetooth PAN access.'
+  printf 'Wi-Fi target: %s\nCurrent wlan0: %s\n' "$target" "$current" >&2
+  printf 'WARNING: changing wlan0 can disconnect SSH if this session uses Wi-Fi. Use Bluetooth PAN.\n' >&2
+  confirm
+}
+
 wireless_connect() {
   need_root; need_pi
   command -v fzf >/dev/null || fail 'fzf is required for profile selection.'
-  local picked
-  # Match the fzf selector style used by yohi/dotfiles-term/tmux/tmux-selector.sh.
-  picked="$(nmcli -g NAME connection show | fzf --no-multi --prompt='Select Wi-Fi profile: ' --height=40% --reverse --border)" || return 0
+  local picked uuid kind mode name rows
+  rows="$(saved_wifi_rows)" || fail 'Cannot read saved Wi-Fi profiles.'
+  # AP-mode profiles are shown in wifi profiles but never offered for STA.
+  rows="$(printf '%s\n' "$rows" | awk -F '\t' '$3 != "ap" && NF >= 3')"
+  [[ -n "$rows" ]] || { log 'No saved Wi-Fi client profiles.'; return 0; }
+  picked="$(printf '%s\n' "$rows" | fzf --no-multi --delimiter=$'\t' --with-nth=2,3 \
+    --prompt='Select saved Wi-Fi: ' --height=40% --reverse --border)" || return 0
   [[ -n "$picked" ]] || return 0
-  [[ "$(profile_property "$picked" connection.type)" == 802-11-wireless ]] || fail 'Selected profile is not Wi-Fi.'
-  [[ "$picked" != "$AP_PROFILE" ]] || fail 'Use recovery start for the recovery AP.'
-  log "Connecting wlan0 using existing profile: $picked (may stop the recovery AP)."
-  nmcli --ask --wait 45 connection up "$picked" ifname "$WIFI_IF"
+  uuid="${picked%%$'\t'*}"
+  [[ "$uuid" =~ ^[[:xdigit:]-]{36}$ ]] || fail 'Invalid Wi-Fi profile selection.'
+  kind="$(profile_property "$uuid" connection.type)"
+  mode="$(profile_property "$uuid" 802-11-wireless.mode)"
+  name="$(profile_property "$uuid" connection.id)"
+  [[ "$kind" == 802-11-wireless && "$mode" != ap && "$name" != "$AP_PROFILE" ]] || fail 'Selected profile is not a Wi-Fi client.'
+  confirm_wifi_switch "saved profile $name ($uuid)" || { log 'Cancelled.'; return 0; }
+  nmcli --ask --wait 45 connection up uuid "$uuid" ifname "$WIFI_IF"
+}
+
+wifi_scan_connect() {
+  need_root; need_pi
+  command -v fzf >/dev/null || fail 'fzf is required for Wi-Fi selection.'
+  [[ "$(wifi_current)" != "$AP_PROFILE" ]] || fail \
+    'Recovery AP is active. Stop it explicitly before scanning for Wi-Fi clients.'
+  local rows picked bssid rest ssid
+  rows="$(visible_wifi_rows)" || fail 'Wi-Fi scan failed.'
+  [[ -n "$rows" ]] || { log 'No visible, named Wi-Fi access points.'; return 0; }
+  picked="$(printf '%s\n' "$rows" | fzf --no-multi --delimiter=$'\t' --with-nth=2,3,4,5,6 \
+    --prompt='Select nearby Wi-Fi: ' --height=40% --reverse --border \
+    --header='SSID | CHANNEL | FREQ | SIGNAL | SECURITY')" || return 0
+  [[ -n "$picked" ]] || return 0
+  bssid="${picked%%$'\t'*}"
+  rest="${picked#*$'\t'}"
+  ssid="${rest%%$'\t'*}"
+  [[ "$bssid" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ && -n "$ssid" ]] || fail 'Invalid Wi-Fi scan selection.'
+  confirm_wifi_switch "SSID $ssid (BSSID $bssid)" || { log 'Cancelled.'; return 0; }
+  nmcli --ask --wait 45 device wifi connect "$ssid" ifname "$WIFI_IF" bssid "$bssid"
 }
 
 bt_info() {
@@ -316,8 +415,9 @@ tui() {
         '[Recovery AP Start]'
         '[Recovery AP Stop]'
         '[Recovery AP Password]'
-        '[Wi-Fi Profiles]'
-        '[Wi-Fi Connect]'
+        '[Saved Wi-Fi Profiles]'
+        '[Wi-Fi Connect Saved]'
+        '[Wi-Fi Scan & Connect]'
       )
     fi
     menu_options+=(
@@ -341,7 +441,7 @@ tui() {
           printf 'DEMO (%s): simulated status; no live network information is read.\n' "$selected_role"
           printf 'PAN: sample connected | Bluetooth: sample available | Wi-Fi: sample connected\n'
           ;;
-        '[Wi-Fi Profiles]')
+        '[Saved Wi-Fi Profiles]')
           printf 'DEMO: sample saved profiles: iPhone-Hotspot, Recovery-AP\n'
           ;;
         *) printf 'DEMO: selected %s; no command or service action executed.\n' "$choice" ;;
@@ -360,8 +460,9 @@ tui() {
       '[Recovery AP Start]') run_action ap_start ;;
       '[Recovery AP Stop]') run_action ap_stop ;;
       '[Recovery AP Password]') run_action ap_password ;;
-      '[Wi-Fi Profiles]') wifi_profiles ;;
-      '[Wi-Fi Connect]') run_action wireless_connect ;;
+      '[Saved Wi-Fi Profiles]') wifi_profiles ;;
+      '[Wi-Fi Connect Saved]') wireless_connect ;;
+      '[Wi-Fi Scan & Connect]') wifi_scan_connect ;;
       '[Bluetooth Devices]') bt_info ;;
       '[Logs]') journalctl -u pi-pan-guardian-pan.service -u pi-pan-guardian-recovery.service -u NetworkManager -n 70 --no-pager || true ;;
       '[Exit]'|'') return 0 ;;
@@ -371,7 +472,7 @@ tui() {
 }
 usage() {
   cat <<USAGE
-Usage: pi-panctl {status|tui|demo pi|host|pan configure|pan ensure|wifi profiles|wifi connect|bt info|
+Usage: pi-panctl {status|tui|demo pi|host|pan configure|pan ensure|wifi profiles|wifi connect|wifi scan|bt info|
                   recovery setup|recovery password|recovery start|recovery stop|
                   recovery enable|recovery disable|recovery legacy-disable|recovery check}
 Network mutations require root. Do not restart bluetooth, rfkill, or NetworkManager.
@@ -384,7 +485,7 @@ case "${1:-}" in
   pan)
     case "${2:-}" in configure) configure_pan ;; ensure) ensure_pan ;; *) usage; exit 2 ;; esac ;;
   wifi)
-    case "${2:-}" in profiles) wifi_profiles ;; connect) wireless_connect ;; *) usage; exit 2 ;; esac ;;
+    case "${2:-}" in profiles) wifi_profiles ;; connect) wireless_connect ;; scan) wifi_scan_connect ;; *) usage; exit 2 ;; esac ;;
   bt)
     case "${2:-}" in info) bt_info ;; *) usage; exit 2 ;; esac ;;
   recovery)
