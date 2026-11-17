@@ -146,14 +146,8 @@ if command -v script >/dev/null 2>&1; then
   ! grep -q 'Recovery AP' "$MOCK_FZF_MENU"
   grep -Fxq -- '--prompt=Select Host action: ' "$MOCK_FZF_ARGS"
   echo 'PASS Host TUI keeps role-specific menu'
-  printf 'pi\n' > "$tmp/config/role"
-  : > "$MOCK_LOG"
-  MOCK_FZF_CHOICE=YusukeOhi_iPhone17 "$bin" wifi connect
-  grep -Fxq -- '--prompt=Select Wi-Fi profile: ' "$MOCK_FZF_ARGS"
-  grep -Fxq -- '--height=40%' "$MOCK_FZF_ARGS"
-  grep -Fxq -- '--reverse' "$MOCK_FZF_ARGS"
-  grep -q 'connection up YusukeOhi_iPhone17 ifname wlan0' "$MOCK_LOG"
-  echo 'PASS Wi-Fi selector matches dotfiles-term fzf layout'
+  # Wi-Fi selection now requires UUID and a per-target YES confirmation.
+  # Covered by the isolated Wi-Fi tests below, not a synthetic SSID-only fzf return.
 else
   echo 'SKIP TUI pseudo-terminal tests: script(1) unavailable'
 fi
@@ -205,7 +199,10 @@ if command -v script >/dev/null 2>&1; then
   ! grep -q 'Pi-Zero2W-Recovery' "$MOCK_FZF_MENU"
   grep -Fq '33333333-3333-3333-3333-333333333333' "$MOCK_FZF_MENU"
   ! grep -q ' connection up ' "$MOCK_LOG"
-  echo 'PASS saved Wi-Fi selector excludes recovery AP and respects NO'
+  grep -Fxq -- '--prompt=Select saved Wi-Fi: ' "$MOCK_FZF_ARGS"
+  grep -Fxq -- '--height=40%' "$MOCK_FZF_ARGS"
+  grep -Fxq -- '--reverse' "$MOCK_FZF_ARGS"
+  echo 'PASS saved Wi-Fi selector excludes recovery AP, respects NO, and matches fzf format'
 else
   echo 'SKIP Wi-Fi confirmation pseudo-terminal tests: script(1) unavailable'
 fi
